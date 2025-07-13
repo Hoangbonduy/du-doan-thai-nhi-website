@@ -43,6 +43,48 @@ function call_orthanc_api($url, $user, $pass) {
     return ($http_code == 200) ? $response : null;
 }
 
+/**
+ * Tải file từ Orthanc và ghi trực tiếp vào đĩa để tiết kiệm bộ nhớ.
+ * @param string $url URL của file trên Orthanc.
+ * @param string $user Tên người dùng Orthanc.
+ * @param string $pass Mật khẩu Orthanc.
+ * @param string $destination_path Đường dẫn đầy đủ để lưu file.
+ * @return bool Trả về true nếu thành công, false nếu thất bại.
+ */
+function stream_orthanc_file_to_disk($url, $user, $pass, $destination_path) {
+    // Mở một file trên đĩa ở chế độ ghi nhị phân (binary mode 'wb')
+    $file_handle = fopen($destination_path, 'wb');
+    if (!$file_handle) {
+        return false; // Không thể tạo file để ghi
+    }
+
+    $curl = curl_init($url);
+    // Yêu cầu cURL ghi output vào file handle đã mở
+    curl_setopt($curl, CURLOPT_FILE, $file_handle);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 10);
+    curl_setopt($curl, CURLOPT_TIMEOUT, 300); // Tăng timeout cho các file lớn có thể tải lâu
+    curl_setopt($curl, CURLOPT_USERPWD, $user . ":" . $pass);
+    
+    // Thực thi, dữ liệu sẽ được stream vào file
+    curl_exec($curl);
+    
+    $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    
+    curl_close($curl);
+    fclose($file_handle); // Luôn đóng file handle
+
+    // Kiểm tra xem việc tải có thành công không
+    if ($http_code != 200) {
+        // Nếu tải lỗi, xóa file rỗng hoặc file chưa hoàn chỉnh đi
+        if (file_exists($destination_path)) {
+            unlink($destination_path);
+        }
+        return false;
+    }
+
+    return true;
+}
+
 // ==================================================================
 // CHỈ LẤY DỮ LIỆU KHI LÀ REQUEST GET (để tránh lấy lại ảnh sau khi submit)
 // ==================================================================
@@ -145,123 +187,161 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                                 </div>
                             <?php endif; ?>
 
-                            <!-- Khu vực để hiển thị kết quả dự đoán (chỉ hoạt động khi là POST request) -->
                             <div id="prediction-result" class="mt-4">
                                 <?php
                                 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     echo '<div class="alert alert-info"><strong>CẢNH BÁO:</strong> Quá trình dự đoán có thể mất nhiều thời gian. Vui lòng không tắt hoặc tải lại trang.</div>';
+                                    flush(); @ob_flush();
 
                                     if (isset($_POST['instance_ids']) && is_array($_POST['instance_ids']) && !empty($_POST['instance_ids'])) {
                                         $selected_ids = $_POST['instance_ids'];
                                         echo "<h4 class='mb-3'>Kết quả dự đoán:</h4>";
 
-                                        // ===================================================================
-                                        // CẤU HÌNH ĐƯỜNG DẪN VÀ THAM SỐ MODEL
-                                        // *** SỬA ĐỔI TẠI ĐÂY ***
-                                        // ===================================================================
-                                        // Sử dụng __DIR__ để có đường dẫn tuyệt đối đến thư mục hiện tại, an toàn hơn
-                                        $base_dir = __DIR__; 
-                                        $tmp_dir = $base_dir . '/tmp/';
+                                        // =========================================================================
+                                        // --- CẤU HÌNH ĐƯỜNG DẪN ---
+                                        // =========================================================================
+                                        $base_dir = __DIR__;
+                                        $DS = DIRECTORY_SEPARATOR; 
+                                        $tmp_dir = $base_dir . $DS . 'tmp' . $DS;
                                         
-                                        $input_dir = $tmp_dir . 'input/';
-                                        $nii_dir = $tmp_dir . 'nii/';
-                                        $output_dir = $tmp_dir . 'output/';
-                                        $visual_dir = $tmp_dir . 'visuals/';
-                                        $visual_dir_web = 'tmp/visuals/'; // Đường dẫn web tương đối
+                                        $input_dicom_dir = $tmp_dir . 'input_dicom' . $DS;
+                                        $input_png_dir   = $tmp_dir . 'input_png' . $DS;
+                                        // Thư mục này sẽ chứa mask thô từ nnU-Net
+                                        $output_mask_dir = $tmp_dir . 'output_mask' . $DS;
+                                        // Thư mục này sẽ chứa ảnh kết quả cuối cùng đã được vẽ contour
+                                        $visual_dir      = $tmp_dir . 'visuals' . $DS;
+                                        
+                                        // Đường dẫn web tương đối để thẻ <img> có thể truy cập
+                                        $visual_dir_web = 'tmp/visuals/';
 
-                                        // Đường dẫn đến script Python để visualize
-                                        $path_to_visualizer = $base_dir . '/visualize_result.py';
-                                        
-                                        // Tham số cho model nnU-Net của bạn
-                                        $model_params = "-d 110 -c 2d -f 0 -tr nnUNetTrainer_100epochs -p nnUNetPlans --disable_tta";
+                                        // --- CẤU HÌNH SCRIPT VÀ MODEL ---
+                                        // Đường dẫn đến các script Python của bạn
+                                        $path_to_dcm_converter = $base_dir . $DS . 'dcm_to_png_first_frame.py'; // Script chỉ xuất frame đầu tiên
+                                        $path_to_predictor     = $base_dir . $DS . 'run_predict.py';          // Script dự đoán và visualize mới
+
+                                        // Đường dẫn đến thư mục chứa model nnU-Net của bạn
+                                        // *** SỬA ĐỔI ĐƯỜNG DẪN NÀY CHO ĐÚNG VỚI MÁY CỦA BẠN ***
+                                        $nnunet_dataset_path = 'D:' . $DS . 'Study' . $DS . 'Thai_nhi' . $DS . 'fetal-PCS' . $DS . 'model' . $DS. 'Dataset110_HC' . $DS;
 
                                         // Tạo các thư mục tạm nếu chưa có
-                                        if (!is_dir($input_dir)) mkdir($input_dir, 0777, true);
-                                        if (!is_dir($nii_dir)) mkdir($nii_dir, 0777, true);
-                                        if (!is_dir($output_dir)) mkdir($output_dir, 0777, true);
-                                        if (!is_dir($visual_dir)) mkdir($visual_dir, 0777, true);
-                                        // ===================================================================
+                                        foreach ([$input_dicom_dir, $input_png_dir, $output_mask_dir, $visual_dir] as $dir) {
+                                            if (!is_dir($dir)) mkdir($dir, 0777, true);
+                                        }
 
                                         foreach ($selected_ids as $instance_to_predict) {
                                             $instance_safe_id = htmlspecialchars($instance_to_predict);
-                                            $unique_prefix = $instance_safe_id . '_' . time();
                                             
-                                            echo "<div class='card mb-3'><div class='card-header'>Kết quả cho ảnh ID: {$instance_safe_id}</div><div class='card-body'>";
+                                            // Sử dụng prefix không có time() để có thể cache kết quả
+                                            $caching_prefix = 'dcm_' . preg_replace('/[^a-zA-Z0-9]/', '_', $instance_safe_id);
+
+                                            echo "<div class='card mb-3'><div class='card-header'>Kết quả cho ảnh ID: <strong>{$instance_safe_id}</strong></div><div class='card-body'>";
+                                            flush(); @ob_flush();
+
+                                            // =========================================================================
+                                            // === BƯỚC 1: TẢI FILE DICOM (VỚI CACHING) ===
+                                            // =========================================================================
+                                            $dicom_path = $input_dicom_dir . $caching_prefix . '.dcm';
+                                            echo "<p>1. Chuẩn bị file DICOM... ";
+                                            if (file_exists($dicom_path)) {
+                                                echo "<span class='text-success'>✓ Đã tìm thấy file đã tải.</span></p>";
+                                            } else {
+                                                echo "<span class='spinner-border spinner-border-sm'></span> Đang tải...</p>";
+                                                $success = stream_orthanc_file_to_disk($orthanc . 'instances/' . $instance_safe_id . '/file', $auth_user, $auth_pass, $dicom_path);
+                                                if (!$success || !file_exists($dicom_path)) {
+                                                    echo "<div class='alert alert-danger'>Lỗi: Không thể tải file DICOM.</div></div></div>";
+                                                    continue;
+                                                }
+                                            }
+                                            flush(); @ob_flush();
+
+                                            // =========================================================================
+                                            // === BƯỚC 2: CHUYỂN ĐỔI DICOM -> PNG (VỚI CACHING) ===
+                                            // =========================================================================
+                                            $input_png_path = $input_png_dir . $caching_prefix . '.png';
+                                            echo "<p>2. Chuẩn bị ảnh PNG... ";
+                                            if (file_exists($input_png_path)) {
+                                                echo "<span class='text-success'>✓ Đã tìm thấy file đã chuyển đổi.</span></p>";
+                                            } else {
+                                                echo "<span class='spinner-border spinner-border-sm'></span> Đang chuyển đổi...</p>";
+                                                $cmd_convert = sprintf('chcp 65001 > nul && python %s -i %s -o %s',
+                                                    escapeshellarg($path_to_dcm_converter),
+                                                    escapeshellarg($dicom_path),
+                                                    escapeshellarg($input_png_path)
+                                                );
+                                                $convert_log = shell_exec($cmd_convert . ' 2>&1');
+                                                if (!file_exists($input_png_path)) {
+                                                    echo "<div class='alert alert-danger'><strong>Lỗi: Không thể chuyển đổi sang PNG.</strong><br><pre>{$convert_log}</pre></div></div></div>";
+                                                    continue;
+                                                }
+                                            }
+                                            flush(); @ob_flush();
+
+                                            // =========================================================================
+                                            // === BƯỚC 3: DỰ ĐOÁN, PHÂN TÍCH VÀ VISUALIZE (GỌI run_predict.py) ===
+                                            // =========================================================================
+                                            $final_result_path = $visual_dir . $caching_prefix . '_result.png';
+                                            echo "<p>3. Model AI đang phân tích và đo đạc... ";
+
+                                            // --- KIỂM TRA XEM FILE KẾT QUẢ CUỐI CÙNG ĐÃ TỒN TẠI CHƯA (CACHE) ---
+                                            if (file_exists($final_result_path)) {
+                                                echo "<span class='text-success'>✓ Đã tìm thấy kết quả đã xử lý trước đó.</span></p>";
+                                            } else {
+                                                echo "<span class='spinner-border spinner-border-sm'></span> (Bước này có thể mất vài phút)...</p>";
+                                                flush(); @ob_flush();
+
+                                                // Xây dựng câu lệnh để gọi script run_predict.py
+                                                $cmd_predict = sprintf(
+                                                    'python %s -d %s -id %s -od %s -ifd %s -ofd %s',
+                                                    escapeshellarg($path_to_predictor),
+                                                    escapeshellarg($nnunet_dataset_path),
+                                                    escapeshellarg($input_png_dir),       // Thư mục chứa tất cả ảnh PNG input
+                                                    escapeshellarg($output_mask_dir),     // Thư mục để lưu mask thô
+                                                    escapeshellarg($input_png_path),      // File PNG cụ thể cần dự đoán
+                                                    escapeshellarg($final_result_path)    // File kết quả cuối cùng
+                                                );
+
+                                                // DEBUG: In câu lệnh ra để kiểm tra
+                                                // echo "<h6>Lệnh dự đoán sẽ thực thi:</h6>";
+                                                // echo "<pre class='bg-light p-2 rounded small text-muted'>" . htmlspecialchars($cmd_predict) . "</pre>";
+                                                flush(); @ob_flush();
+
+                                                // Thực thi lệnh và bắt log
+                                                $predict_log = shell_exec($cmd_predict . ' 2>&1');
+
+                                                // Kiểm tra lại sau khi chạy
+                                                if (!file_exists($final_result_path)) {
+                                                    echo "<div class='alert alert-danger'>
+                                                            <strong>Lỗi: Model AI dự đoán hoặc xử lý thất bại.</strong>
+                                                            <br>Log:<pre>{$predict_log}</pre>
+                                                        </div></div></div>";
+                                                    continue;
+                                                }
+                                            }
+                                            flush(); @ob_flush();
                                             
-                                            // 1. LẤY FILE DICOM GỐC TỪ ORTHANC
-                                            echo "<p>1. Đang tải file DICOM... <span class='spinner-border spinner-border-sm'></span></p>";
-                                            flush(); @ob_flush(); // Hiển thị ngay lập tức
-                                            $dicom_data = call_orthanc_api($orthanc . 'instances/' . $instance_safe_id . '/file', $auth_user, $auth_pass);
-                                            if (!$dicom_data) {
-                                                echo "<div class='alert alert-danger'>Lỗi: Không thể tải file DICOM.</div></div></div>";
-                                                continue;
-                                            }
-                                            $dicom_instance_dir = $input_dir . $unique_prefix . '/';
-                                            if (!is_dir($dicom_instance_dir)) mkdir($dicom_instance_dir, 0777, true);
-                                            $dicom_path = $dicom_instance_dir . 'image.dcm';
-                                            file_put_contents($dicom_path, $dicom_data);
-
-                                            // 2. CHUYỂN ĐỔI DICOM -> NIFTI
-                                            echo "<p>2. Đang chuyển đổi sang định dạng NIfTI... <span class='spinner-border spinner-border-sm'></span></p>";
-                                            flush(); @ob_flush();
-                                            $nii_filename_base = $unique_prefix . '_0000';
-                                            $cmd_dcm2niix = sprintf(
-                                                'dcm2niix.exe -o "%s" -f "%s" -z y "%s"',
-                                                rtrim($nii_dir, '\\/'),      // Đường dẫn thư mục output
-                                                $nii_filename_base,         // Tên file output (không cần ngoặc kép)
-                                                rtrim($dicom_instance_dir, '\\/') // Đường dẫn thư mục input
-                                            );
-                                            // Sửa thành dòng này để bắt log
-$                                           $dcm2niix_log = shell_exec($cmd_dcm2niix . ' 2>&1');
-
-                                            $original_nii_path = $nii_dir . $nii_filename_base . '.nii.gz';
-                                            if (!file_exists($original_nii_path)) {
-                                                echo "<div class='alert alert-danger'><strong>Lỗi: Không thể chuyển đổi sang NIfTI.</strong><br>Log chi tiết từ dcm2niix:<pre>{$dcm2niix_log}</pre></div></div></div>";
-                                                continue;
-                                            }
-
-                                            // 3. GỌI nnUNetV2 ĐỂ DỰ ĐOÁN
-                                            echo "<p>3. Model AI đang xử lý... (bước này có thể mất vài phút) <span class='spinner-border spinner-border-sm'></span></p>";
-                                            flush(); @ob_flush();
-                                            $cmd_predict = "python -m nnunetv2.predict -i " . escapeshellarg($nii_dir) . " -o " . escapeshellarg($output_dir) . " " . $model_params;
-                                            $predict_output_log = shell_exec($cmd_predict . ' 2>&1');
-                                            $predicted_mask_path = $output_dir . $nii_filename_base . '.nii.gz';
-                                            if (!file_exists($predicted_mask_path)) {
-                                                echo "<div class='alert alert-danger'>Lỗi: Model AI thất bại. Log: <pre>{$predict_output_log}</pre></div></div></div>";
-                                                continue;
-                                            }
-
-                                            // 4. TẠO ẢNH VISUALIZE
-                                            echo "<p>4. Đang tạo ảnh kết quả... <span class='spinner-border spinner-border-sm'></span></p>";
-                                            flush(); @ob_flush();
-                                            $visual_png_path = $visual_dir . $unique_prefix . '.png';
-                                            $cmd_visualize = "python " . escapeshellarg($path_to_visualizer) . " " . escapeshellarg($original_nii_path) . " " . escapeshellarg($predicted_mask_path) . " " . escapeshellarg($visual_png_path);
-                                            shell_exec($cmd_visualize);
-
-                                            // 5. HIỂN THỊ KẾT QUẢ
-                                            if (file_exists($visual_png_path)) {
-                                                $original_preview_src = 'data:image/png;base64,' . base64_encode(call_orthanc_api($orthanc . 'instances/' . $instance_safe_id . '/preview', $auth_user, $auth_pass));
-                                                $web_path_to_visual = $visual_dir_web . $unique_prefix . '.png';
+                                            // =========================================================================
+                                            // === BƯỚC 4: HIỂN THỊ KẾT QUẢ ===
+                                            // =========================================================================
+                                            if (file_exists($final_result_path)) {
+                                                // Lấy ảnh PNG gốc để so sánh
+                                                $original_png_src = 'data:image/png;base64,' . base64_encode(file_get_contents($input_png_path));
+                                                
+                                                // Đường dẫn web đến ảnh kết quả
+                                                $web_path_to_visual = $visual_dir_web . basename($final_result_path);
                                                 
                                                 echo "<div class='row mt-3'>";
-                                                echo "  <div class='col-md-6 text-center'><h6>Ảnh Gốc</h6><img src='{$original_preview_src}' class='img-fluid border rounded'></div>";
-                                                echo "  <div class='col-md-6 text-center'><h6>Kết quả Dự đoán</h6><img src='{$web_path_to_visual}?t=".time()."' class='img-fluid border rounded'></div>";
+                                                echo "  <div class='col-md-6 text-center'><h6>Ảnh Gốc (PNG)</h6><img src='{$original_png_src}' class='img-fluid border rounded'></div>";
+                                                echo "  <div class='col-md-6 text-center'><h6>Kết quả Đo đạc</h6><img src='{$web_path_to_visual}?t=".time()."' class='img-fluid border rounded'></div>";
                                                 echo "</div>";
                                             } else {
-                                                echo "<div class='alert alert-danger'>Lỗi: Không thể tạo ảnh kết quả.</div>";
+                                                // Trường hợp này hiếm khi xảy ra nếu logic ở trên đúng
+                                                echo "<div class='alert alert-danger'>Lỗi: Không tìm thấy file kết quả để hiển thị.</div>";
                                             }
                                             
-                                            // 6. DỌN DẸP FILE TẠM
-                                            unlink($dicom_path);
-                                            rmdir($dicom_instance_dir);
-                                            unlink($original_nii_path);
-                                            unlink($predicted_mask_path);
-                                            // Giữ lại file PNG kết quả để hiển thị
-
-                                            echo "</div></div>"; // Đóng card-body và card
+                                            // Đóng card
+                                            echo "</div></div>";
                                         }
 
-                                        // Thêm nút để quay lại chọn ảnh
                                         echo '<div class="mt-4 text-center"><a href="predict.php?study_id='.htmlspecialchars($study_id).'" class="btn btn-primary">Dự đoán ảnh khác trong ca chụp này</a></div>';
 
                                     } else {

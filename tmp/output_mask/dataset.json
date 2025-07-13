@@ -1,0 +1,14 @@
+{
+    "channel_names": {
+        "0": "grayscale"
+    },
+    "labels": {
+        "background": 0,
+        "HC": 1
+    },
+    "numTraining": 350,
+    "file_ending": ".png",
+    "licence": "Whoever converted this dataset was lazy and didn't look it up!",
+    "converted_by": "Please enter your name, especially when sharing datasets with others in a common infrastructure!",
+    "name": "Dataset110_HC"
+}
